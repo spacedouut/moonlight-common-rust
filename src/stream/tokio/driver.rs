@@ -22,6 +22,10 @@ pub struct StreamDriver<Stream> {
     inner: Stream,
     socket: UdpSocket,
     recv_buffer: Vec<u8>,
+    /// Deadline for which [UdpStream::handle_timeout] already ran. A stream that keeps
+    /// reporting the same deadline in the past is only woken once for it, instead of
+    /// turning the drive loop into a busy spin.
+    handled_timeout: Option<Instant>,
 }
 
 impl<Stream> StreamDriver<Stream>
@@ -39,6 +43,7 @@ where
             inner: stream,
             socket,
             recv_buffer: vec![0; 4096],
+            handled_timeout: None,
         })
     }
 
@@ -122,6 +127,7 @@ where
                 match this.driver.socket.poll_recv_from(cx, &mut recv_buffer) {
                     Poll::Ready(Ok(addr)) => {
                         received = true;
+                        this.driver.handled_timeout = None;
 
                         this.driver.inner.handle_receive(
                             SansInstant::from_std(this.driver.base_time.into_std()),
@@ -153,8 +159,11 @@ where
                     this.sleep.as_mut().reset(deadline);
                 }
 
-                // Poll Timeout
-                if this.sleep.as_mut().poll(cx).is_ready() {
+                // Poll Timeout, but only once per deadline
+                if this.driver.handled_timeout != Some(deadline)
+                    && this.sleep.as_mut().poll(cx).is_ready()
+                {
+                    this.driver.handled_timeout = Some(deadline);
                     this.driver
                         .inner
                         .handle_timeout(SansInstant::from_std(this.driver.base_time.into_std()))?;
@@ -272,6 +281,56 @@ mod tests {
                 assert!(diff <= Duration::from_millis(10), "driver slept too long or short");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stale_timeout_does_not_spin() {
+        // A stream whose deadline lies in the past and never moves must get exactly one
+        // timeout per deadline, not a hot loop.
+        let base_time = Instant::now();
+        let stream = TestStream {
+            timeout: Some(SansInstant::ZERO),
+            ..Default::default()
+        };
+        let mut driver = StreamDriver::new(base_time, stream).await.unwrap();
+
+        let mut timeouts = 0;
+        let end = sleep(Duration::from_millis(100));
+        tokio::pin!(end);
+        loop {
+            select! {
+                _ = &mut end => break,
+                result = driver.drive() => {
+                    assert!(matches!(result.unwrap(), TestEvent::Timeout(_)));
+                    timeouts += 1;
+                }
+            }
+        }
+        assert_eq!(timeouts, 1, "stale deadline fired {timeouts} times");
+
+        // A packet re-arms the (still stale) deadline exactly once more
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut addr = driver.socket.local_addr().unwrap();
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+        socket.send_to(&[1], addr).await.unwrap();
+
+        let mut events = Vec::new();
+        let end = sleep(Duration::from_millis(100));
+        tokio::pin!(end);
+        loop {
+            select! {
+                _ = &mut end => break,
+                result = driver.drive() => events.push(result.unwrap()),
+            }
+        }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [TestEvent::Receive { .. }, TestEvent::Timeout(_)]
+            ),
+            "got {} events",
+            events.len()
+        );
     }
 
     #[tokio::test]

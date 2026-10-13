@@ -288,7 +288,20 @@ impl UdpStream for VideoStream {
     }
 
     fn poll_timeout(&self) -> Option<Instant> {
-        Some(self.last_now + self.wait_until_idr())
+        let wait = self.wait_until_idr();
+        let frame_timeout = if wait.is_zero() {
+            // Already stuck: nothing changes until the next idr request is due
+            self.waiting_for_idr_since
+                .map(|since| since + IDR_REQUEST_TIMEOUT)
+                .unwrap_or(self.last_now)
+        } else {
+            self.last_now + wait
+        };
+
+        Some(match self.ping_sender.poll_timeout() {
+            Some(ping) => ping.min(frame_timeout),
+            None => frame_timeout,
+        })
     }
 
     fn poll_event(&mut self) -> Option<Self::Event> {

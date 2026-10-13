@@ -163,10 +163,13 @@ impl UdpStream for AudioStream {
     }
 
     fn poll_timeout(&self) -> Option<Instant> {
-        if !self.dropped_frames {
-            None
-        } else {
-            Some(self.last_frame + MAXIMUM_SAMPLE_WAIT)
+        // While frames are flowing we need to notice when they stop; once they're
+        // marked dropped only a new packet changes anything, so don't keep waking up.
+        let frame_timeout = (!self.dropped_frames).then(|| self.last_frame + MAXIMUM_SAMPLE_WAIT);
+
+        match (self.ping_sender.poll_timeout(), frame_timeout) {
+            (Some(ping), Some(frame)) => Some(ping.min(frame)),
+            (ping, frame) => ping.or(frame),
         }
     }
 
